@@ -41,6 +41,145 @@ function App() {
     const productInputRef = useRef(null);
     const templateInputRef = useRef(null);
 
+    // Retry & Session isolation refs
+    const retryCountsRef = useRef({});
+    const activeRetriesRef = useRef({});
+    const slotGenIdsRef = useRef({});
+
+    // Helper to check if overall generation is complete (all slots have succeeded or failed, with no skeletons/pending retries)
+    const checkGlobalCompletion = () => {
+        setOutputs(currOutputs => {
+            const hasSkeletons = currOutputs.some(item => item.status === 'skeleton');
+            if (!hasSkeletons) {
+                setGenerating(false);
+                const hasErrors = currOutputs.some(item => item.status === 'error');
+                setStatusText(hasErrors ? 'Synthesis complete (some variations failed)' : 'Synthesis complete!');
+            }
+            return currOutputs;
+        });
+    };
+
+    // Background retry runner with staggered backoff
+    const runRetryWithBackoff = async (targetIndex, expectedSlotGenId) => {
+        // If the slot has been overridden by a new session/manual generation, discard this retry
+        if (slotGenIdsRef.current[targetIndex] !== expectedSlotGenId) return;
+
+        const currentAttempt = (retryCountsRef.current[targetIndex] || 0) + 1;
+        retryCountsRef.current[targetIndex] = currentAttempt;
+
+        // Set state to skeleton status with retry details
+        setOutputs(prev => prev.map(item => 
+            item.index === targetIndex 
+                ? { index: targetIndex, status: 'skeleton', message: `Retrying slot ${targetIndex + 1} (Attempt ${currentAttempt}/4)...` } 
+                : item
+        ));
+
+        // Randomized backoff delay between 5s to 8s
+        const delayMs = (5 + Math.random() * 3) * 1000;
+        setStatusText('Retrying failed slots in background...');
+
+        const timeoutId = setTimeout(async () => {
+            // Remove from tracking timeouts
+            if (activeRetriesRef.current[targetIndex] === timeoutId) {
+                delete activeRetriesRef.current[targetIndex];
+            }
+
+            if (slotGenIdsRef.current[targetIndex] !== expectedSlotGenId) return;
+
+            // Prepare single slot payload
+            const formData = new FormData();
+            formData.append('prompt', prompt);
+            formData.append('target_index', targetIndex.toString());
+            
+            productFiles.forEach(file => {
+                formData.append('product_images', file);
+            });
+            formData.append('template_images', templateFiles[targetIndex]);
+
+            try {
+                const response = await fetch(`${API_URL}/generate`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errData = await response.json().catch(() => ({}));
+                    throw new Error(errData.message || `Server returned error status ${response.status}`);
+                }
+
+                if (slotGenIdsRef.current[targetIndex] !== expectedSlotGenId) return;
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
+                let resultChunk = null;
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    if (slotGenIdsRef.current[targetIndex] !== expectedSlotGenId) return;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+
+                    for (const line of lines) {
+                        if (line.trim() === '') continue;
+                        try {
+                            const chunk = JSON.parse(line);
+                            if (chunk.status === 'success' && chunk.image && chunk.image.startsWith('data:')) {
+                                chunk.image = base64ToBlobUrl(chunk.image);
+                            }
+                            resultChunk = chunk;
+                        } catch (err) {
+                            console.error('Error parsing retry NDJSON chunk:', err);
+                        }
+                    }
+                }
+
+                if (buffer.trim() !== '') {
+                    try {
+                        const chunk = JSON.parse(buffer);
+                        if (chunk.status === 'success' && chunk.image && chunk.image.startsWith('data:')) {
+                            chunk.image = base64ToBlobUrl(chunk.image);
+                        }
+                        resultChunk = chunk;
+                    } catch (err) {
+                        console.error('Error parsing final retry chunk:', err);
+                    }
+                }
+
+                if (slotGenIdsRef.current[targetIndex] !== expectedSlotGenId) return;
+
+                if (resultChunk && resultChunk.status === 'success') {
+                    setOutputs(prev => prev.map(item => item.index === targetIndex ? resultChunk : item));
+                    checkGlobalCompletion();
+                } else {
+                    throw new Error((resultChunk && resultChunk.message) || 'Image generation failed');
+                }
+
+            } catch (err) {
+                console.error(`Retry attempt ${currentAttempt}/4 failed for slot ${targetIndex + 1}:`, err);
+                
+                if (slotGenIdsRef.current[targetIndex] !== expectedSlotGenId) return;
+
+                if (currentAttempt < 4) {
+                    runRetryWithBackoff(targetIndex, expectedSlotGenId);
+                } else {
+                    setOutputs(prev => prev.map(item => 
+                        item.index === targetIndex 
+                            ? { index: targetIndex, status: 'error', message: err.message || 'Max retries reached.' } 
+                            : item
+                    ));
+                    checkGlobalCompletion();
+                }
+            }
+        }, delayMs);
+
+        activeRetriesRef.current[targetIndex] = timeoutId;
+    };
+
     // Get thumbnail previews (supports HEIC/AVIF placeholders)
     const getFilePreviewSrc = (file) => {
         const isHEIC = /\.(heic|heif)$/i.test(file.name);
@@ -115,15 +254,29 @@ function App() {
             }
         });
 
+        // Cancel all pending timeouts from previous sessions
+        if (activeRetriesRef.current) {
+            Object.values(activeRetriesRef.current).forEach(timeoutId => clearTimeout(timeoutId));
+            activeRetriesRef.current = {};
+        }
+        retryCountsRef.current = {};
+
         setGenerating(true);
         setStatusText('Allocating worker threads...');
         
-        // Setup slot skeletons
-        const initialSlots = templateFiles.map((_, idx) => ({
-            index: idx,
-            status: 'skeleton'
-        }));
+        // Setup slot skeletons and assign/increment their generation IDs
+        const initialSlots = templateFiles.map((_, idx) => {
+            slotGenIdsRef.current[idx] = (slotGenIdsRef.current[idx] || 0) + 1;
+            return {
+                index: idx,
+                status: 'skeleton'
+            };
+        });
         setOutputs(initialSlots);
+
+        // Capture local snapshot of the slot Gen IDs for this session
+        const currentSlotGenIds = { ...slotGenIdsRef.current };
+        const receivedIndices = new Set();
 
         // Prep multipart form data
         const formData = new FormData();
@@ -165,10 +318,23 @@ function App() {
                     if (line.trim() === '') continue;
                     try {
                         let chunk = JSON.parse(line);
+                        
+                        // If this slot was overridden/canceled, ignore this chunk
+                        if (slotGenIdsRef.current[chunk.index] !== currentSlotGenIds[chunk.index]) {
+                            continue;
+                        }
+
+                        receivedIndices.add(chunk.index);
+
                         if (chunk.status === 'success' && chunk.image && chunk.image.startsWith('data:')) {
                             chunk.image = base64ToBlobUrl(chunk.image);
                         }
-                        setOutputs(prev => prev.map(item => item.index === chunk.index ? chunk : item));
+
+                        if (chunk.status === 'error') {
+                            runRetryWithBackoff(chunk.index, currentSlotGenIds[chunk.index]);
+                        } else {
+                            setOutputs(prev => prev.map(item => item.index === chunk.index ? chunk : item));
+                        }
                     } catch (err) {
                         console.error('Error parsing NDJSON chunk:', err);
                     }
@@ -178,32 +344,40 @@ function App() {
             if (buffer.trim() !== '') {
                 try {
                     let chunk = JSON.parse(buffer);
-                    if (chunk.status === 'success' && chunk.image && chunk.image.startsWith('data:')) {
-                        chunk.image = base64ToBlobUrl(chunk.image);
+                    if (slotGenIdsRef.current[chunk.index] === currentSlotGenIds[chunk.index]) {
+                        receivedIndices.add(chunk.index);
+                        
+                        if (chunk.status === 'success' && chunk.image && chunk.image.startsWith('data:')) {
+                            chunk.image = base64ToBlobUrl(chunk.image);
+                        }
+
+                        if (chunk.status === 'error') {
+                            runRetryWithBackoff(chunk.index, currentSlotGenIds[chunk.index]);
+                        } else {
+                            setOutputs(prev => prev.map(item => item.index === chunk.index ? chunk : item));
+                        }
                     }
-                    setOutputs(prev => prev.map(item => item.index === chunk.index ? chunk : item));
                 } catch (err) {
                     console.error('Error parsing final chunk:', err);
                 }
             }
 
-            // Check errors
-            setOutputs(currOutputs => {
-                const hasErrors = currOutputs.some(item => item.status === 'error');
-                setStatusText(hasErrors ? 'Synthesis complete (some variations failed)' : 'Synthesis complete!');
-                return currOutputs;
-            });
-
         } catch (err) {
             console.error('Connection failed:', err);
-            setStatusText('Failed to stage jewelry renders.');
+            // Any slot that is still skeleton and belongs to this generation gets marked as error
             setOutputs(prev => prev.map(item => 
-                item.status === 'skeleton' 
+                (item.status === 'skeleton' && slotGenIdsRef.current[item.index] === currentSlotGenIds[item.index])
                     ? { ...item, status: 'error', message: err.message || 'Stream connection lost.' } 
                     : item
             ));
         } finally {
-            setGenerating(false);
+            // Trigger auto-retry for any slot that remained skeleton (wasn't processed at all by stream)
+            templateFiles.forEach((_, idx) => {
+                if (!receivedIndices.has(idx) && slotGenIdsRef.current[idx] === currentSlotGenIds[idx]) {
+                    runRetryWithBackoff(idx, currentSlotGenIds[idx]);
+                }
+            });
+            checkGlobalCompletion();
         }
     };
 
@@ -255,6 +429,17 @@ function App() {
             URL.revokeObjectURL(targetOutput.image);
         }
 
+        // Cancel any pending timeouts/retries for this specific slot
+        if (activeRetriesRef.current[targetIndex]) {
+            clearTimeout(activeRetriesRef.current[targetIndex]);
+            delete activeRetriesRef.current[targetIndex];
+        }
+
+        // Increment generation ID and reset retry counter for this isolated slot
+        slotGenIdsRef.current[targetIndex] = (slotGenIdsRef.current[targetIndex] || 0) + 1;
+        const currentSlotGenId = slotGenIdsRef.current[targetIndex];
+        retryCountsRef.current[targetIndex] = 0;
+
         setGenerating(true);
         setStatusText(`Regenerating slot ${targetIndex + 1}...`);
 
@@ -288,13 +473,18 @@ function App() {
                 throw new Error(errData.message || `Server returned error status ${response.status}`);
             }
 
+            if (slotGenIdsRef.current[targetIndex] !== currentSlotGenId) return;
+
             const reader = response.body.getReader();
             const decoder = new TextDecoder('utf-8');
             let buffer = '';
+            let parsedChunk = null;
 
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
+
+                if (slotGenIdsRef.current[targetIndex] !== currentSlotGenId) return;
 
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
@@ -307,7 +497,7 @@ function App() {
                         if (chunk.status === 'success' && chunk.image && chunk.image.startsWith('data:')) {
                             chunk.image = base64ToBlobUrl(chunk.image);
                         }
-                        setOutputs(prev => prev.map(item => item.index === chunk.index ? chunk : item));
+                        parsedChunk = chunk;
                     } catch (err) {
                         console.error('Error parsing NDJSON chunk:', err);
                     }
@@ -320,29 +510,33 @@ function App() {
                     if (chunk.status === 'success' && chunk.image && chunk.image.startsWith('data:')) {
                         chunk.image = base64ToBlobUrl(chunk.image);
                     }
-                    setOutputs(prev => prev.map(item => item.index === chunk.index ? chunk : item));
+                    parsedChunk = chunk;
                 } catch (err) {
                     console.error('Error parsing final chunk:', err);
                 }
             }
 
-            // Update status text
-            setOutputs(currOutputs => {
-                const hasErrors = currOutputs.some(item => item.status === 'error');
-                setStatusText(hasErrors ? 'Synthesis complete (some variations failed)' : 'Synthesis complete!');
-                return currOutputs;
-            });
+            if (slotGenIdsRef.current[targetIndex] !== currentSlotGenId) return;
+
+            if (parsedChunk) {
+                if (parsedChunk.status === 'success') {
+                    setOutputs(prev => prev.map(item => item.index === targetIndex ? parsedChunk : item));
+                } else {
+                    throw new Error(parsedChunk.message || 'Generation failed.');
+                }
+            } else {
+                throw new Error('No chunk received from backend.');
+            }
 
         } catch (err) {
             console.error('Regeneration failed:', err);
-            setOutputs(prev => prev.map(item => 
-                item.index === targetIndex 
-                    ? { index: targetIndex, status: 'error', message: err.message || 'Stream connection lost.' } 
-                    : item
-            ));
-            setStatusText('Regeneration failed.');
+            if (slotGenIdsRef.current[targetIndex] === currentSlotGenId) {
+                runRetryWithBackoff(targetIndex, currentSlotGenId);
+            }
         } finally {
-            setGenerating(false);
+            if (slotGenIdsRef.current[targetIndex] === currentSlotGenId) {
+                checkGlobalCompletion();
+            }
         }
     };
 
@@ -550,7 +744,7 @@ function App() {
                                         {slot.status === 'skeleton' && (
                                             <div className="skeleton-spinner">
                                                 <div className="spinner-ring"></div>
-                                                <span className="spinner-text">Staging Template {slot.index + 1}</span>
+                                                <span className="spinner-text">{slot.message || `Staging Template ${slot.index + 1}`}</span>
                                             </div>
                                         )}
                                         
